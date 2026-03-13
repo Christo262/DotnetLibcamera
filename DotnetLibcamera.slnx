@@ -1,0 +1,24 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="ARM" />
+    <Platform Name="ARM64" />
+  </Configurations>
+  <Folder Name="/samples/">
+    <Project Path="samples/SampleImageSharp/SampleImageSharp.csproj" />
+  </Folder>
+  <Folder Name="/sln/">
+    <File Path="license.md" />
+    <File Path="readme.md" />
+  </Folder>
+  <Folder Name="/src/" />
+  <Folder Name="/src/dotnet/">
+    <Project Path="src/dotnet/Libcamera/Libcamera.csproj" />
+  </Folder>
+  <Folder Name="/src/wrapper/">
+    <Project Path="src/wrapper/libcamera_wrapper/libcamera_wrapper.vcxproj">
+      <Platform Solution="*|Any CPU" Project="ARM" />
+      <Deploy />
+    </Project>
+  </Folder>
+</Solution>
