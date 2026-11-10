@@ -6,6 +6,7 @@
 #include <libcamera/controls.h>
 #include <libcamera/framebuffer.h>
 #include <libcamera/framebuffer_allocator.h>
+#include <libcamera/orientation.h>
 #include <libcamera/property_ids.h>
 #include <libcamera/request.h>
 #include <libcamera/stream.h>
@@ -13,9 +14,11 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -123,6 +126,119 @@ namespace {
 
         *outFormats = cfg->at(0).formats();
         return 0;
+    }
+
+    // Every control libcamera knows, by name, made once: the camera's own list only has what it takes, and what a
+    // frame reports (ColourTemperature, Lux) is not among those.
+    static const ControlId* control_named(const char* name)
+    {
+        static const std::unordered_map<std::string, const ControlId*> byName = [] {
+            std::unordered_map<std::string, const ControlId*> map;
+            for (const auto& kv : controls::controls)
+                map[kv.second->name()] = kv.second;
+            return map;
+        }();
+        if (!name) return nullptr;
+        auto it = byName.find(name);
+        return it == byName.end() ? nullptr : it->second;
+    }
+
+    template <typename T>
+    static int put_numbers(const ControlValue& v, double* out, int capacity)
+    {
+        if (v.isArray()) {
+            auto span = v.get<std::span<const T>>();
+            int n = static_cast<int>(span.size());
+            if (n > capacity) return -4;
+            for (int i = 0; i < n; i++) out[i] = static_cast<double>(span[i]);
+            return n;
+        }
+        if (capacity < 1) return -4;
+        out[0] = static_cast<double>(v.get<T>());
+        return 1;
+    }
+
+    // A control's value as doubles: one for a number, two for a size, four for a rectangle, several for an array.
+    static int to_doubles(const ControlValue& v, double* out, int capacity)
+    {
+        if (!out) return -1;
+        switch (v.type()) {
+        case ControlTypeNone: return 0;
+        case ControlTypeBool:
+            if (v.isArray()) return -5;
+            if (capacity < 1) return -4;
+            out[0] = v.get<bool>() ? 1.0 : 0.0;
+            return 1;
+        case ControlTypeByte: return put_numbers<uint8_t>(v, out, capacity);
+        case ControlTypeInteger32: return put_numbers<int32_t>(v, out, capacity);
+        case ControlTypeInteger64: return put_numbers<int64_t>(v, out, capacity);
+        case ControlTypeFloat: return put_numbers<float>(v, out, capacity);
+        case ControlTypeRectangle: {
+            if (v.isArray() || capacity < 4) return v.isArray() ? -5 : -4;
+            auto r = v.get<Rectangle>();
+            out[0] = r.x; out[1] = r.y; out[2] = r.width; out[3] = r.height;
+            return 4;
+        }
+        case ControlTypeSize: {
+            if (v.isArray() || capacity < 2) return v.isArray() ? -5 : -4;
+            auto z = v.get<Size>();
+            out[0] = z.width; out[1] = z.height;
+            return 2;
+        }
+        default: return -5;
+        }
+    }
+
+    template <typename T>
+    static ControlValue numbers_as(const ControlId* id, const double* values, int count)
+    {
+        if (id->isArray()) {
+            std::vector<T> items(count);
+            for (int i = 0; i < count; i++) items[i] = static_cast<T>(std::llround(values[i]));
+            return ControlValue(std::span<const T>(items.data(), items.size()));
+        }
+        return ControlValue(static_cast<T>(std::llround(values[0])));
+    }
+
+    // Doubles as a value of the control's own type, or a ControlValue of type None when they cannot be.
+    static ControlValue from_doubles(const ControlId* id, const double* values, int count)
+    {
+        if (!values || count < 1) return ControlValue();
+        if (id->isArray() && id->size() > 0 && static_cast<size_t>(count) != id->size()) return ControlValue();
+        if (!id->isArray() && id->type() != ControlTypeRectangle && id->type() != ControlTypeSize && count != 1) return ControlValue();
+        switch (id->type()) {
+        case ControlTypeBool: return id->isArray() ? ControlValue() : ControlValue(values[0] != 0.0);
+        case ControlTypeByte: return numbers_as<uint8_t>(id, values, count);
+        case ControlTypeInteger32: return numbers_as<int32_t>(id, values, count);
+        case ControlTypeInteger64: return numbers_as<int64_t>(id, values, count);
+        case ControlTypeFloat: {
+            if (id->isArray()) {
+                std::vector<float> items(values, values + count);
+                return ControlValue(std::span<const float>(items.data(), items.size()));
+            }
+            return ControlValue(static_cast<float>(values[0]));
+        }
+        case ControlTypeRectangle:
+            if (id->isArray() || count != 4) return ControlValue();
+            return ControlValue(Rectangle(static_cast<int>(std::lround(values[0])), static_cast<int>(std::lround(values[1])),
+                static_cast<unsigned int>(std::lround(values[2])), static_cast<unsigned int>(std::lround(values[3]))));
+        case ControlTypeSize:
+            if (id->isArray() || count != 2) return ControlValue();
+            return ControlValue(Size(static_cast<unsigned int>(std::lround(values[0])), static_cast<unsigned int>(std::lround(values[1]))));
+        default: return ControlValue();
+        }
+    }
+
+    // The camera's own entry for a control, or null when it does not take it.
+    static const ControlInfo* camera_info(lc_camera_t* c, const char* name, const ControlId** idOut = nullptr)
+    {
+        if (!c) return nullptr;
+        const ControlId* id = control_named(name);
+        if (!id) return nullptr;
+        if (idOut) *idOut = id;
+        const ControlInfoMap& infos = c->camera->controls();
+        auto it = infos.find(id);
+        return it == infos.end() ? nullptr : &it->second;
     }
 
 } // namespace
@@ -324,8 +440,10 @@ extern "C" {
     {
         if (!c || !width || !height) return -1;
 
+        // The whole pixel array's area: Raspberry Pi's libcamera builds since October 2026 have no PixelArraySize, and
+        // the area has the same width and height in every build.
         const ControlList& props = c->camera->properties();
-        auto size = props.get(properties::PixelArraySize);
+        auto size = props.get(properties::PixelArrayArea);
         if (!size) return -2;
 
         *width = size->width;
@@ -482,6 +600,112 @@ extern "C" {
         return 0;
     }
 
+    // --- Any control, by name ---
+
+    int lc_camera_control_count(lc_camera_t* c)
+    {
+        if (!c) return -1;
+        return static_cast<int>(c->camera->controls().size());
+    }
+
+    int lc_camera_control_name(lc_camera_t* c, int index, char* buffer, size_t buffer_size)
+    {
+        if (!c || !buffer) return -1;
+        const ControlInfoMap& infos = c->camera->controls();
+        if (index < 0 || static_cast<size_t>(index) >= infos.size()) return -2;
+        auto it = infos.begin();
+        std::advance(it, index);
+        return safe_copy_string(it->first->name(), buffer, buffer_size);
+    }
+
+    int lc_control_type(const char* name, int* type, int* is_array)
+    {
+        if (!type || !is_array) return -1;
+        const ControlId* id = control_named(name);
+        if (!id) return -2;
+        *type = static_cast<int>(id->type());
+        *is_array = id->isArray() ? 1 : 0;
+        return 0;
+    }
+
+    int lc_camera_control_limit(lc_camera_t* c, const char* name, int which, double* values, int capacity)
+    {
+        if (!c || !values) return -1;
+        const ControlInfo* info = camera_info(c, name);
+        if (!info) return control_named(name) ? -3 : -2;
+        const ControlValue& v = which == 0 ? info->min() : which == 1 ? info->max() : info->def();
+        return to_doubles(v, values, capacity);
+    }
+
+    int lc_camera_control_value_count(lc_camera_t* c, const char* name)
+    {
+        const ControlInfo* info = camera_info(c, name);
+        if (!info) return control_named(name) ? -3 : -2;
+        return static_cast<int>(info->values().size());
+    }
+
+    int lc_camera_control_value(lc_camera_t* c, const char* name, int index, double* value)
+    {
+        if (!value) return -1;
+        const ControlInfo* info = camera_info(c, name);
+        if (!info) return control_named(name) ? -3 : -2;
+        const auto& values = info->values();
+        if (index < 0 || static_cast<size_t>(index) >= values.size()) return -4;
+        return to_doubles(values[index], value, 1);
+    }
+
+    int lc_control_enum_count(const char* name)
+    {
+        const ControlId* id = control_named(name);
+        if (!id) return -2;
+        return static_cast<int>(id->enumerators().size());
+    }
+
+    int lc_control_enum(const char* name, int index, int32_t* value, char* buffer, size_t buffer_size)
+    {
+        if (!value || !buffer) return -1;
+        const ControlId* id = control_named(name);
+        if (!id) return -2;
+        const auto& names = id->enumerators();
+        if (index < 0 || static_cast<size_t>(index) >= names.size()) return -4;
+        auto it = names.begin();
+        std::advance(it, index);
+        *value = it->first;
+        return safe_copy_string(it->second, buffer, buffer_size);
+    }
+
+    int lc_request_set_control(lc_request_t* r, const char* name, const double* values, int count)
+    {
+        if (!r || !r->request || !r->camera) return -1;
+        const ControlId* id = nullptr;
+        if (!camera_info(r->camera, name, &id)) return id || control_named(name) ? -3 : -2;
+        ControlValue v = from_doubles(id, values, count);
+        if (v.type() == ControlTypeNone) return -4;
+        r->request->controls().set(id->id(), v);
+        return count;
+    }
+
+    int lc_request_get_metadata(lc_request_t* r, const char* name, double* values, int capacity)
+    {
+        if (!r || !r->request) return -1;
+        const ControlId* id = control_named(name);
+        if (!id) return -2;
+        const ControlList& meta = r->request->metadata();
+        if (!meta.contains(id->id())) return -3;
+        return to_doubles(meta.get(id->id()), values, capacity);
+    }
+
+    int lc_config_set_orientation(lc_config_t* cfg, int hflip, int vflip)
+    {
+        if (!cfg || !cfg->config) return -1;
+        // A vertical flip alone is half a turn and a mirror; both flips together are the half turn alone.
+        cfg->config->orientation = hflip && vflip ? Orientation::Rotate180
+            : vflip ? Orientation::Rotate180Mirror
+            : hflip ? Orientation::Rotate0Mirror
+            : Orientation::Rotate0;
+        return 0;
+    }
+
     // --- Config ---
 
     lc_config_t* lc_camera_generate_configuration(lc_camera_t* c)
@@ -514,6 +738,17 @@ extern "C" {
     {
         if (!cfg || !cfg->config || cfg->config->empty()) return -1;
         cfg->config->at(0).pixelFormat = PixelFormat(fourcc);
+        return 0;
+    }
+
+    int lc_config_set_sensor_mode(lc_config_t* cfg, uint32_t width, uint32_t height, uint32_t bit_depth)
+    {
+        if (!cfg || !cfg->config || width == 0 || height == 0 || bit_depth == 0) return -1;
+        // The Raspberry Pi pipeline picks the sensor mode by these two; the rest is left as it would choose it.
+        SensorConfiguration sensor;
+        sensor.outputSize = { width, height };
+        sensor.bitDepth = bit_depth;
+        cfg->config->sensorConfig = sensor;
         return 0;
     }
 

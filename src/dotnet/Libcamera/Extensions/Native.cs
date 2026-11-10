@@ -134,6 +134,13 @@ public static class LibcameraNative
     [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int lc_config_set_pixel_format(IntPtr config, uint fourcc);
 
+    /// <summary>
+    /// The sensor mode to take the picture from, by its output size and bit depth. Without it libcamera picks the mode
+    /// nearest the picture's size, which for a small picture can be a crop of the middle of the sensor.
+    /// </summary>
+    [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int lc_config_set_sensor_mode(IntPtr config, uint width, uint height, uint bitDepth);
+
     [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int lc_config_validate(IntPtr config);
 
@@ -218,6 +225,97 @@ public static class LibcameraNative
 
     [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
     public static extern int lc_request_set_control_ae(IntPtr request, int enable);
+
+    // --- Any control, by its libcamera name ---
+
+    [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int lc_camera_control_count(IntPtr camera);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int lc_camera_control_name(IntPtr camera, int index, byte[] buffer, UIntPtr bufferSize);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int lc_control_type(string name, out int type, out int isArray);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int lc_camera_control_limit(IntPtr camera, string name, int which, double[] values, int capacity);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int lc_camera_control_value_count(IntPtr camera, string name);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int lc_camera_control_value(IntPtr camera, string name, int index, out double value);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int lc_control_enum_count(string name);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+    private static extern int lc_control_enum(string name, int index, out int value, byte[] buffer, UIntPtr bufferSize);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int lc_request_set_control(IntPtr request, string name, double[] values, int count);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int lc_request_get_metadata(IntPtr request, string name, double[] values, int capacity);
+
+    [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern int lc_config_set_orientation(IntPtr config, int hflip, int vflip);
+
+    /// <summary>
+    /// Every control the camera takes, with its range, what it starts at, and for a choice the names of the values
+    /// it allows. Empty from a wrapper built before controls could be listed.
+    /// </summary>
+    public static IReadOnlyDictionary<string, Models.CameraControl> GetControls(IntPtr camera)
+    {
+        var found = new Dictionary<string, Models.CameraControl>(StringComparer.Ordinal);
+        int count;
+        try
+        {
+            count = lc_camera_control_count(camera);
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return found;
+        }
+
+        var buffer = new byte[128];
+        var values = new double[16];
+        for (int i = 0; i < count; i++)
+        {
+            if (lc_camera_control_name(camera, i, buffer, (UIntPtr)buffer.Length) < 0)
+                continue;
+            string name = Text(buffer);
+            if (lc_control_type(name, out int type, out int isArray) < 0)
+                continue;
+
+            double[] Limit(int which)
+            {
+                int n = lc_camera_control_limit(camera, name, which, values, values.Length);
+                return n > 0 ? values[..n] : [];
+            }
+
+            // A choice's names, kept to the values the camera allows when it says which those are.
+            var allowed = new HashSet<int>();
+            int allowedCount = lc_camera_control_value_count(camera, name);
+            for (int j = 0; j < allowedCount; j++)
+                if (lc_camera_control_value(camera, name, j, out double value) > 0)
+                    allowed.Add((int)value);
+            var choices = new Dictionary<string, int>(StringComparer.Ordinal);
+            int enums = lc_control_enum_count(name);
+            for (int j = 0; j < enums; j++)
+                if (lc_control_enum(name, j, out int value, buffer, (UIntPtr)buffer.Length) >= 0 && (allowed.Count == 0 || allowed.Contains(value)))
+                    choices[Text(buffer)] = value;
+
+            found[name] = new Models.CameraControl(name, (Models.ControlType)type, isArray != 0, Limit(0), Limit(1), Limit(2), choices);
+        }
+        return found;
+    }
+
+    private static string Text(byte[] buffer)
+    {
+        int nullIndex = Array.IndexOf(buffer, (byte)0);
+        return Encoding.UTF8.GetString(buffer, 0, nullIndex >= 0 ? nullIndex : buffer.Length);
+    }
 
     // --- Helpers ---
 
